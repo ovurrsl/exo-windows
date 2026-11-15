@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from collections.abc import Generator, Mapping
@@ -132,6 +133,13 @@ def mlx_distributed_init(
                 os.environ["MLX_HOSTFILE"] = coordination_file
                 os.environ["MLX_RANK"] = str(rank)
                 # os.environ["MLX_RING_VERBOSE"] = "1"  # NOTE: we don't use it enough to care (turn on again if need to)
+
+                if sys.platform == "win32":
+                    from exo.worker.engines.mlx.win32_ring import (
+                        install_win32_ring_patch,
+                    )
+
+                    install_win32_ring_patch()
 
                 group = mx.distributed.init(backend="ring", strict=True)
 
