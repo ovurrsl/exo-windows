@@ -1,5 +1,6 @@
 import errno
 import socket
+import sys
 from typing import cast
 
 import anyio
@@ -32,8 +33,17 @@ def listen_on_api_port(port: int) -> socket.socket:
     takes connections from the moment exo announces it.
     """
     listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Like hypercorn: a port left in TIME_WAIT by the last exo can be taken again straight away
-    listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform == "win32":
+        # On Windows SO_REUSEADDR lets a second process bind an active port;
+        # SO_EXCLUSIVEADDRUSE ensures port conflicts fail with EADDRINUSE.
+        listening_socket.setsockopt(
+            socket.SOL_SOCKET,
+            cast(int, getattr(socket, "SO_EXCLUSIVEADDRUSE", socket.SO_REUSEADDR)),
+            1,
+        )
+    else:
+        # Like hypercorn: a port left in TIME_WAIT by the last exo can be taken again straight away
+        listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listening_socket.bind((API_BIND_HOST, port))
     except OSError as error:
@@ -51,7 +61,13 @@ async def serve_on_socket(
     """Serve the app on the socket the node bound when it started, until `shutdown` is set.
     Hypercorn takes ownership of the socket."""
     config = Config()
-    config.bind = [f"fd://{listening_socket.detach()}"]
+    if sys.platform == "win32":
+        # Hypercorn's fd:// parser calls socket.AF_UNIX, which is unavailable on Windows.
+        host, port = cast(tuple[str, int], listening_socket.getsockname()[:2])
+        listening_socket.close()
+        config.bind = [f"{host}:{port}"]
+    else:
+        config.bind = [f"fd://{listening_socket.detach()}"]
     # nb: shared.logging needs updating if any of this changes
     config.accesslog = None
     config.errorlog = "-"

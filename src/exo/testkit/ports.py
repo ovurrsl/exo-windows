@@ -13,13 +13,18 @@ in the temp directory, which every harness sharing it respects.
 """
 
 import contextlib
-import fcntl
 import random
 import socket
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO, final
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    import msvcrt
 
 PORTS = range(20000, 32768)
 LEASES = Path(tempfile.gettempdir()) / "exo-testkit-ports"
@@ -52,7 +57,10 @@ def lease_port() -> PortLease:
         port = PORTS[(start + offset) % len(PORTS)]
         lock = (LEASES / f"{port}.lock").open("a")
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform != "win32":
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             lock.close()  # another harness holds it
             continue
