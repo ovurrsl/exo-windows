@@ -1,3 +1,4 @@
+import importlib
 import os
 import shutil
 import sys
@@ -5,7 +6,7 @@ import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from subprocess import CalledProcessError
-from typing import Self, cast
+from typing import Protocol, Self, cast
 
 import anyio
 from anyio import fail_after, open_process, to_thread
@@ -355,9 +356,15 @@ async def _gather_iface_map() -> dict[str, str] | None:
     return ports
 
 
+class _NvmlCountModule(Protocol):
+    def nvmlInit(self) -> None: ...  # noqa: N802
+    def nvmlShutdown(self) -> None: ...  # noqa: N802
+    def nvmlDeviceGetCount(self) -> int: ...  # noqa: N802
+
+
 def _has_nvml_cuda() -> bool:
     try:
-        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
+        nvml = cast(_NvmlCountModule, cast(object, importlib.import_module("pynvml")))
     except ImportError:
         return False
     try:
@@ -524,14 +531,26 @@ class InfoGatherer:
             if override_memory_env
             else None
         )
+        prefer_cuda_vram = not IS_DARWIN and await to_thread.run_sync(_has_nvml_cuda)
+        if prefer_cuda_vram:
+            logger.info("CUDA NVML detected; reporting GPU VRAM as node memory")
+
+        def _sample_memory() -> MemoryUsage:
+            if prefer_cuda_vram:
+                usage = MemoryUsage.from_cuda(
+                    override_memory=override_memory,
+                    gpu_working_set=self._gpu_working_set,
+                )
+                if usage is not None:
+                    return usage
+            return MemoryUsage.from_psutil(
+                override_memory=override_memory,
+                gpu_working_set=self._gpu_working_set,
+            )
+
         while True:
             try:
-                await self.info_sender.send(
-                    MemoryUsage.from_psutil(
-                        override_memory=override_memory,
-                        gpu_working_set=self._gpu_working_set,
-                    )
-                )
+                await self.info_sender.send(await to_thread.run_sync(_sample_memory))
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering memory usage")
             await anyio.sleep(memory_poll_rate)
