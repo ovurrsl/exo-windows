@@ -76,9 +76,12 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.patches.cuda_compat import apply_cuda_compat_patches
 from exo.worker.engines.mlx.sharding.pipeline import get_inner_model, get_layers
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
+
+apply_cuda_compat_patches()
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -823,21 +826,33 @@ def set_wired_limit_for_model(model_size: Memory):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
-    if not mx.metal.is_available():
-        return
-
-    max_rec_size = Memory.from_bytes(
-        int(mx.device_info()["max_recommended_working_set_size"])
-    )
-    if model_size > 0.9 * max_rec_size:
-        logger.warning(
-            f"Generating with a model that requires {model_size.in_float_mb:.1f} MB "
-            f"which is close to the maximum recommended size of {max_rec_size.in_float_mb:.1f} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+    if mx.metal.is_available():
+        max_rec_size = Memory.from_bytes(
+            int(mx.device_info()["max_recommended_working_set_size"])
         )
-    mx.set_wired_limit(max_rec_size.in_bytes)
-    logger.info(f"Wired limit set to {max_rec_size}.")
+        if model_size > 0.9 * max_rec_size:
+            logger.warning(
+                f"Generating with a model that requires {model_size.in_float_mb:.1f} MB "
+                f"which is close to the maximum recommended size of {max_rec_size.in_float_mb:.1f} "
+                "MB. This can be slow. See the documentation for possible work-arounds: "
+                "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+            )
+        mx.set_wired_limit(max_rec_size.in_bytes)
+        logger.info(f"Wired limit set to {max_rec_size}.")
+    elif hasattr(mx, "cuda") and mx.cuda.is_available():
+        # Reserve ~2 GB headroom for CUDA context / driver overhead to prevent
+        # cudaMallocAsync OOM during layer loading.
+        total_vram = int(mx.device_info()["total_memory"])
+        usable = max(total_vram - 2 * 1024 * 1024 * 1024, 0)
+        mx.set_memory_limit(usable)
+        mx.set_wired_limit(usable)
+        mx.set_cache_limit(0)
+        logger.info(
+            f"CUDA backend active — memory limit set to "
+            f"{Memory.from_bytes(usable).in_float_mb:.0f} MB "
+            f"(total {Memory.from_bytes(total_vram).in_float_mb:.0f} MB, "
+            f"reserved 2048 MB for driver)."
+        )
 
 
 def mlx_cleanup(
