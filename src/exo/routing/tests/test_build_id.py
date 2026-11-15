@@ -4,7 +4,11 @@ from types import ModuleType
 import pytest
 
 from exo import __version__
-from exo.routing.wire import _installed, build_id  # pyright: ignore[reportPrivateUsage]
+from exo.routing.wire import (
+    _installed,  # pyright: ignore[reportPrivateUsage]
+    _normalize_mlx_version,  # pyright: ignore[reportPrivateUsage]
+    build_id,
+)
 
 
 def test_the_app_names_its_own_build() -> None:
@@ -61,3 +65,22 @@ def test_package_metadata_comes_first() -> None:
         raise AssertionError(f"imported {name}")
 
     assert _installed("mlx", lambda _: "0.32.4", never) == "0.32.4"
+
+
+def test_build_id_normalizes_mlx_dev_build_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    versions = {
+        "mlx": "0.32.4.dev20261115+36969c09",
+        "mlx-lm": "0.32.3.dev16+g6b572ab1b",
+    }
+
+    def fake_installed(dist: str) -> str:
+        return versions[dist]
+
+    monkeypatch.setattr("exo.routing.wire._installed", fake_installed)
+    assert (
+        build_id({}) == f"exo {__version__}, mlx 0.32.4, mlx-lm 0.32.3.dev16+g6b572ab1b"
+    )
+    assert _normalize_mlx_version("0.32.4") == "0.32.4"
+    assert _normalize_mlx_version("none") == "none"
