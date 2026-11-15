@@ -269,11 +269,21 @@ fn epoch_millis(time: SystemTime) -> u64 {
 fn local_time(time: SystemTime) -> String {
     let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = libc::time_t::try_from(since.as_secs()).unwrap_or(0);
-    // SAFETY: an all-zero `tm` is a valid value, and localtime_r only writes into it
+    // SAFETY: an all-zero `tm` is a valid value, and localtime_r/localtime_s only writes into it
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are to live values for the duration of the call
-    if unsafe { libc::localtime_r(&raw const seconds, &raw mut tm) }.is_null() {
-        return format!("{}.{:03}", since.as_secs(), since.subsec_millis());
+    #[cfg(unix)]
+    {
+        // SAFETY: both pointers are to live values for the duration of the call
+        if unsafe { libc::localtime_r(&raw const seconds, &raw mut tm) }.is_null() {
+            return format!("{}.{:03}", since.as_secs(), since.subsec_millis());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: both pointers are to live values for the duration of the call
+        if unsafe { libc::localtime_s(&raw mut tm, &raw const seconds) } != 0 {
+            return format!("{}.{:03}", since.as_secs(), since.subsec_millis());
+        }
     }
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
