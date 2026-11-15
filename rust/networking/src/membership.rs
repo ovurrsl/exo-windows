@@ -221,15 +221,16 @@ impl Now {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 const CLOCK_WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC;
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 const CLOCK_WITH_SLEEP: libc::clockid_t = libc::CLOCK_BOOTTIME;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 const CLOCK_WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC;
 
 /// The clock that keeps counting while the machine sleeps; zero if it can't be read (then only
 /// a frozen process shows as a stall, not a sleep)
+#[cfg(unix)]
 fn clock_with_sleep() -> Duration {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -243,6 +244,17 @@ fn clock_with_sleep() -> Duration {
         u64::try_from(time.tv_sec).unwrap_or(0),
         u32::try_from(time.tv_nsec).unwrap_or(0),
     )
+}
+
+/// The clock that keeps counting while the machine sleeps (`GetTickCount64` keeps counting
+/// across system sleep and hibernation).
+#[cfg(windows)]
+fn clock_with_sleep() -> Duration {
+    unsafe extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    // SAFETY: GetTickCount64 takes no arguments and returns milliseconds since system start.
+    Duration::from_millis(unsafe { GetTickCount64() })
 }
 
 /// Whether the time from the tick at `before` to the one at `now` means this node was stopped:
