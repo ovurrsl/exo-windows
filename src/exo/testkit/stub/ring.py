@@ -26,6 +26,7 @@ rank.
 import errno
 import socket
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from typing import cast, final
@@ -87,7 +88,8 @@ class Ring:
         if accept_from:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if sys.platform != "win32" and hasattr(socket, "SO_REUSEPORT"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             # The harness's proxy and every peer on this machine dial 127.0.0.1: listening on
             # every interface would open LAN-reachable ports for nothing
             listener.bind(("127.0.0.1", _port(instance, rank, proxy_port)))

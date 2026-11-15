@@ -1,19 +1,19 @@
 import argparse
 import multiprocessing as mp
 import os
-import resource
 import shutil
 import signal
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Self
+from importlib import import_module
+from typing import Protocol, Self, cast
 
 import anyio
 from anyio import to_thread
 from anyio.lowlevel import checkpoint as anyio_checkpoint
-from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
 from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
@@ -48,6 +48,7 @@ from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
 from exo.utils.exit_guard import exit_if_shutdown_hangs
 from exo.utils.pydantic_ext import FrozenModel
+from exo.utils.rlimits import raise_nofile_limit
 from exo.utils.task_group import TaskGroup
 from exo.worker.main import Worker
 
@@ -254,7 +255,10 @@ class Node:
         )
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
-            signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
+            if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
             tg.start_soon(self.membership.run)
@@ -423,6 +427,17 @@ def main():
 
     try:
         if args.legacy_daemon:
+            if sys.platform == "win32":
+                print("--legacy-daemon is not supported on Windows", file=sys.stderr)
+                raise SystemExit(2)
+
+            class _DaemonModule(Protocol):
+                DaemonContext: Callable[..., AbstractContextManager[object]]  # noqa: N815
+
+            daemon_context = cast(
+                _DaemonModule, cast(object, import_module("daemon"))
+            ).DaemonContext
+
             # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
             # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
             for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
@@ -432,7 +447,7 @@ def main():
             stdout = open(os.devnull, "w")  # noqa: SIM115
             stderr = open(os.devnull, "w")  # noqa: SIM115
 
-            with DaemonContext(
+            with daemon_context(
                 detach_process=True,
                 files_preserve=[pidfile.as_raw_fd()],
                 stdin=stdin,
@@ -465,9 +480,7 @@ def main():
 
 
 def main_inner(args: "Args"):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = min(max(soft, 65535), hard)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    raise_nofile_limit(65535)
 
     mp.set_start_method("spawn", force=True)
 
