@@ -19,14 +19,16 @@ import hashlib
 import json
 import os
 import random
+import sys
+import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Buffer, Callable, Iterator, Mapping
 from contextlib import aclosing, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Protocol, final
+from typing import Protocol, cast, final
 
 import anyio
 from anyio import to_thread
@@ -513,7 +515,8 @@ async def _fetch_once(
     progress.files[key].downloaded = offset
     await _io(locks, partial(partial_path.parent.mkdir, parents=True, exist_ok=True))
     # not abandoned on cancel: the descriptor is always ours to close
-    descriptor = await _io(locks, os.open, partial_path, os.O_RDWR | os.O_CREAT, 0o644)
+    open_flags = os.O_RDWR | os.O_CREAT | cast(int, getattr(os, "O_BINARY", 0))
+    descriptor = await _io(locks, os.open, partial_path, open_flags, 0o644)
     try:
         while state.hashed < offset:
             # in steps, so a cancellation waits for one step at most
@@ -560,11 +563,30 @@ async def _fetch_once(
             await _io(locks, os.close, descriptor)
 
 
+_FD_IO_LOCK = threading.Lock()
+
+
+def _pwrite(fd: int, data: Buffer, offset: int) -> int:
+    if sys.platform != "win32" and hasattr(os, "pwrite"):
+        return os.pwrite(fd, data, offset)
+    with _FD_IO_LOCK:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.write(fd, data)
+
+
+def _pread(fd: int, length: int, offset: int) -> bytes:
+    if sys.platform != "win32" and hasattr(os, "pread"):
+        return os.pread(fd, length, offset)
+    with _FD_IO_LOCK:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, length)
+
+
 def _write_at(descriptor: int, data: bytes, offset: int, state: FileState) -> None:
     view = memoryview(data)
     position = offset
     while view:
-        written = os.pwrite(descriptor, view, position)
+        written = _pwrite(descriptor, view, position)
         view = view[written:]
         position += written
     if state.hashed == offset:
@@ -574,7 +596,7 @@ def _write_at(descriptor: int, data: bytes, offset: int, state: FileState) -> No
 
 def _hash_range(descriptor: int, state: FileState, end: int) -> None:
     """Hash up to 64 MiB more of the ``.partial``, towards ``end``."""
-    block = os.pread(descriptor, min(64 << 20, end - state.hashed), state.hashed)
+    block = _pread(descriptor, min(64 << 20, end - state.hashed), state.hashed)
     if not block:
         raise _StartOverError()
     state.hasher.update(block)

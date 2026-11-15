@@ -7,8 +7,7 @@ import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from multiprocessing.process import BaseProcess
-from multiprocessing.resource_sharer import DupFd
-from typing import final
+from typing import Protocol, final
 
 from anyio import (
     TASK_STATUS_IGNORED,
@@ -34,6 +33,40 @@ _TERMINATE_GRACE_SECONDS = 5.0
 _TERMINATE_RETRY_GRACE_SECONDS = 2.0
 _TERMINATE_ATTEMPTS = 10
 _KILL_GRACE_SECONDS = 2.0
+
+
+class _DetachableWriteFd(Protocol):
+    def detach(self) -> int: ...
+
+
+def _share_write_fd(fd: int) -> _DetachableWriteFd:
+    """Wrap a pipe write-end so it can be unpickled in a spawned child."""
+    if sys.platform == "win32":
+        import _winapi
+        import msvcrt
+        from multiprocessing.reduction import DupHandle
+
+        return _WinSharedWriteFd(
+            DupHandle(msvcrt.get_osfhandle(fd), _winapi.DUPLICATE_SAME_ACCESS)
+        )
+
+    from multiprocessing.resource_sharer import DupFd
+
+    return DupFd(fd)
+
+
+class _WinSharedWriteFd:
+    """Convert a Windows DupHandle back into a Python file descriptor."""
+
+    def __init__(self, handle: _DetachableWriteFd) -> None:
+        self._handle = handle
+
+    def detach(self) -> int:
+        if sys.platform != "win32":
+            raise RuntimeError("_WinSharedWriteFd is only supported on Windows")
+        import msvcrt
+
+        return msvcrt.open_osfhandle(self._handle.detach(), 0)
 
 
 @final
@@ -91,8 +124,8 @@ class AsyncProcess:
                     target=_run_with_captured_stdio,
                     name=self._name,
                     args=(
-                        DupFd(stdout_write_fd),
-                        DupFd(stderr_write_fd),
+                        _share_write_fd(stdout_write_fd),
+                        _share_write_fd(stderr_write_fd),
                         self._target,
                         *self._args,
                     ),
@@ -245,8 +278,8 @@ class AsyncProcess:
 
 # Spawn-mode multiprocessing requires a module-level target that can be pickled.
 def _run_with_captured_stdio(
-    stdout: DupFd,
-    stderr: DupFd,
+    stdout: _DetachableWriteFd,
+    stderr: _DetachableWriteFd,
     target: Callable[..., object] | None,
     *target_args: object,
     **target_kwargs: object,
@@ -267,11 +300,46 @@ def _run_with_captured_stdio(
         target(*target_args, **target_kwargs)
 
 
+_WIN32_ERROR_INVALID_FUNCTION = 1
+
+
+async def _read_win32_pipe(fd: int) -> bytes:
+    """Wait without blocking a worker thread until a Windows pipe is readable or closed."""
+    if sys.platform != "win32":
+        return b""
+    import _winapi
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(fd)
+    delay = 0.002
+    while True:
+        try:
+            peek = _winapi.PeekNamedPipe(handle)
+        except BrokenPipeError:
+            return b""
+        except OSError as exc:
+            if exc.winerror == _winapi.ERROR_BROKEN_PIPE:
+                return b""
+            if exc.winerror == _WIN32_ERROR_INVALID_FUNCTION:
+                return await to_thread.run_sync(os.read, fd, _READ_CHUNK_SIZE)
+            raise
+        available = peek[1] if len(peek) == 3 else peek[0]
+        if available > 0:
+            return await to_thread.run_sync(
+                os.read, fd, min(available, _READ_CHUNK_SIZE)
+            )
+        await sleep(delay)
+        delay = min(delay * 1.5, 0.02)
+
+
 async def _drain_fd(fd: int, tx: Sender[bytes]) -> None:
     try:
         while True:
-            await wait_readable(fd)
-            chunk = os.read(fd, _READ_CHUNK_SIZE)
+            if sys.platform == "win32":
+                chunk = await _read_win32_pipe(fd)
+            else:
+                await wait_readable(fd)
+                chunk = os.read(fd, _READ_CHUNK_SIZE)
             if not chunk:
                 return
             await tx.send(chunk)

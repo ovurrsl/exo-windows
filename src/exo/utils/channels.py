@@ -2,7 +2,9 @@ import contextlib
 import multiprocessing as mp
 import pickle
 import select
+import sys
 import threading
+from collections.abc import Buffer
 from dataclasses import dataclass, field
 from functools import wraps
 from inspect import iscoroutinefunction
@@ -233,6 +235,38 @@ class _MpBuffer[T](Protocol):
     def join_thread(self) -> None: ...
 
 
+def _try_send_bytes_win32(handle: int, payload: Buffer) -> bool:
+    """Attempt a non-blocking message write to a Windows overlapped named pipe.
+
+    Returns True when the message was accepted into the pipe, or False if the
+    pipe buffer is full and the write would block.
+    """
+    if sys.platform != "win32":
+        return False
+    import _winapi
+    import ctypes
+
+    overlapped, error = _winapi.WriteFile(handle, payload, overlapped=True)
+    if error == _winapi.ERROR_IO_PENDING:
+        if (
+            _winapi.WaitForMultipleObjects([overlapped.event], False, 0)
+            != _winapi.WAIT_OBJECT_0
+        ):
+            overlapped.cancel()
+            _, cancel_error = overlapped.GetOverlappedResult(True)
+            if cancel_error == _winapi.ERROR_OPERATION_ABORTED:
+                return False
+            if cancel_error != 0:
+                raise ctypes.WinError(cancel_error)
+            return True
+    elif error != 0:
+        raise ctypes.WinError(error)
+    _, result_error = overlapped.GetOverlappedResult(False)
+    if result_error != 0:
+        raise ctypes.WinError(result_error)
+    return True
+
+
 class _ImmediateQueue[T]:
     """A multiprocessing queue whose put has written the item out of the process when it returns.
 
@@ -261,10 +295,15 @@ class _ImmediateQueue[T]:
             # item (such as the end-of-stream marker) needs. (poll, as select can't take
             # descriptors numbered above 1023.)
             if not block:
-                writable = select.poll()
-                writable.register(self._writer, select.POLLOUT)
-                if not writable.poll(0):
-                    raise Full
+                if sys.platform != "win32" and hasattr(select, "poll"):
+                    writable = select.poll()
+                    writable.register(self._writer, select.POLLOUT)
+                    if not writable.poll(0):
+                        raise Full
+                elif sys.platform == "win32" and payload:
+                    if not _try_send_bytes_win32(self._writer.fileno(), payload):
+                        raise Full
+                    return
             self._writer.send_bytes(payload)
         finally:
             self._write_lock.release()
