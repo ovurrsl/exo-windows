@@ -181,11 +181,30 @@ def process_is_running(process: psutil.Process) -> bool:
 
 def _group_members(process_group: int) -> list[psutil.Process]:
     members: list[psutil.Process] = []
+    if sys.platform == "win32":
+        with contextlib.suppress(psutil.Error):
+            root = psutil.Process(process_group)
+            members.append(root)
+            members.extend(root.children(recursive=True))
+        return members
     for process in psutil.process_iter():
         with contextlib.suppress(psutil.Error, ProcessLookupError, PermissionError):
             if os.getpgid(process.pid) == process_group:
                 members.append(process)
     return members
+
+
+def _interrupt_process(process: subprocess.Popen[bytes]) -> None:
+    if sys.platform == "win32":
+        import ctypes
+
+        if ctypes.windll.kernel32.GetConsoleWindow():
+            with contextlib.suppress(OSError):
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                return
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
 
 
 def _holders(protocol: Literal["UDP", "TCP"], port: int) -> list[str]:
@@ -536,10 +555,10 @@ class Cluster:
         ]
         for node, process in live:
             if node.status == "paused":
-                self._signal_group(node, signal.SIGCONT)
+                self._resume_group(node)
             if process.poll() is None:
                 with contextlib.suppress(ProcessLookupError):
-                    process.send_signal(signal.SIGINT)
+                    _interrupt_process(process)
         deadline = time.monotonic() + _CLOSE_GRACE
         for node, process in live:
             try:
@@ -626,13 +645,17 @@ class Cluster:
                 f"\n=== {node.name} generation {node.generation} id {node.node_id}\n".encode()
             )
             output.flush()
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+            )
             node.process = subprocess.Popen(
                 arguments,
                 env=self._environment(node),
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
+                start_new_session=sys.platform != "win32",
+                creationflags=creationflags,
                 cwd=node.home,
             )
         node.status = "running"
@@ -692,10 +715,30 @@ class Cluster:
         return [node for node in self.nodes if node.status == "running"]
 
     def _signal_group(self, node: Node, signal_number: signal.Signals) -> None:
-        if node.process is None:
+        if sys.platform == "win32" or node.process is None:
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(node.process.pid, signal_number)
+
+    def _pause_group(self, node: Node) -> None:
+        if node.process is None:
+            return
+        if sys.platform == "win32":
+            for member in _group_members(node.process.pid):
+                with contextlib.suppress(psutil.Error):
+                    member.suspend()
+            return
+        self._signal_group(node, signal.SIGSTOP)
+
+    def _resume_group(self, node: Node) -> None:
+        if node.process is None:
+            return
+        if sys.platform == "win32":
+            for member in _group_members(node.process.pid):
+                with contextlib.suppress(psutil.Error):
+                    member.resume()
+            return
+        self._signal_group(node, signal.SIGCONT)
 
     def _kill_group(self, node: Node) -> None:
         """SIGKILL every process of the node's group (the node and its runners), except
@@ -712,7 +755,7 @@ class Cluster:
                         member.kill()
         # Only the tracker is left; if the node was paused, it is stopped too and would never
         # clean up
-        self._signal_group(node, signal.SIGCONT)
+        self._resume_group(node)
 
     def _outlived(self, node: Node) -> list[str]:
         """The group's members still alive besides the resource tracker (runners)."""
@@ -764,13 +807,13 @@ class Cluster:
     def pause(self, index: int) -> None:
         """SIGSTOP the node and its runners: a laptop going to sleep (its sockets stay open)."""
         node = self.nodes[index]
-        self._signal_group(node, signal.SIGSTOP)
+        self._pause_group(node)
         node.status = "paused"
         self.note(f"SIGSTOP {node.name}")
 
     def resume(self, index: int) -> None:
         node = self.nodes[index]
-        self._signal_group(node, signal.SIGCONT)
+        self._resume_group(node)
         node.status = "running"
         self.note(f"SIGCONT {node.name}")
 
@@ -782,10 +825,10 @@ class Cluster:
         if node.process is None or node.status == "stopped":
             raise HarnessError(f"{node.name} isn't running")
         # A paused node (and its resource tracker) must run to handle the signal
-        self._signal_group(node, signal.SIGCONT)
+        self._resume_group(node)
         started = time.monotonic()
         self.note(f"SIGINT {node.name}")
-        node.process.send_signal(signal.SIGINT)
+        _interrupt_process(node.process)
         try:
             node.process.wait(timeout)
         except subprocess.TimeoutExpired as error:

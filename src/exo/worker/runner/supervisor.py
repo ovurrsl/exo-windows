@@ -94,6 +94,13 @@ UNSTOPPABLE_RUNNER_ERROR = (
     "The model's process on this device couldn't be stopped. Restart this device."
 )
 
+
+def _is_expected_shutdown_exit(rc: int | None) -> bool:
+    if sys.platform == "win32":
+        return rc == -signal.SIGTERM
+    return rc in (-signal.SIGTERM, -signal.SIGKILL)
+
+
 # How long a runner may take over each step on its way to serving. Every step waits on things
 # outside the runner (the instance's other runners, the disk, MLX), and a runner that will never
 # get through one would hold its instance, and every request for it, forever: one that takes
@@ -858,9 +865,8 @@ class RunnerSupervisor:
                 self.in_progress.pop(task.task_id, None)
                 self._end_output(task.task_id)
 
-        if isinstance(self.status, RunnerShuttingDown) and rc in (
-            -signal.SIGTERM,
-            -signal.SIGKILL,
+        if isinstance(self.status, RunnerShuttingDown) and _is_expected_shutdown_exit(
+            rc
         ):
             # It was told to stop (see stop), and had to be terminated: no failure of its own
             self.shutdown()

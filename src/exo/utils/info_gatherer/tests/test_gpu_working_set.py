@@ -1,9 +1,11 @@
 import json
+import sys
 
 import psutil
 import pytest
 
 from exo.shared.types.memory import Memory
+from exo.shared.types.profiling import query_cuda_vram_bytes
 from exo.utils.info_gatherer.macmon import MacmonMetrics
 from exo.utils.info_gatherer.system_info import get_gpu_working_set
 
@@ -47,7 +49,13 @@ def test_memory_reports_carry_the_gpus_working_set() -> None:
 def test_the_gpus_working_set_is_most_of_the_ram() -> None:
     working_set = get_gpu_working_set()
     if working_set is None:
-        pytest.skip("Needs a Mac with Metal")
+        pytest.skip("Needs a Mac with Metal or a CUDA GPU")
 
-    ram = psutil.virtual_memory().total
-    assert 0.5 * ram < working_set.in_bytes < ram
+    if sys.platform == "darwin":
+        ram = psutil.virtual_memory().total
+        assert 0.5 * ram < working_set.in_bytes < ram
+        return
+
+    vram = query_cuda_vram_bytes()
+    assert vram is not None
+    assert 0.5 * vram[0] < working_set.in_bytes <= vram[0]

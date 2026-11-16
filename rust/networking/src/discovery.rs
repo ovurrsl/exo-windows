@@ -42,6 +42,18 @@ const OTHER_CLUSTER_NOTICE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// unchanged.
 pub const ANNOUNCE_TO_ENV: &str = "EXO_TESTKIT_DISCOVERY_ANNOUNCE_TO";
 
+/// `netwatcher::WatchHandle` wraps a raw OS handle (`*mut c_void` on Windows)
+/// which is not automatically `Send`/`Sync`. The handle is a kernel object and
+/// is only stored so interface-change callbacks keep running.
+struct SendWatchHandle(WatchHandle);
+
+// SAFETY: the wrapped handle is an OS watcher resource. It is not accessed
+// concurrently (we never lock or call into it after construction; Drop is the
+// only use) and Windows HANDLEs / Unix watcher FDs may be released from any
+// thread.
+unsafe impl Send for SendWatchHandle {}
+unsafe impl Sync for SendWatchHandle {}
+
 pub struct Discovery {
     sock: Arc<UdpSocket>,
     ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
@@ -59,7 +71,7 @@ pub struct Discovery {
     stall_guard: StallGuard,
     /// Where Hellos go instead of the multicast group (`ANNOUNCE_TO_ENV`), if anywhere
     announce_to: Option<Vec<SocketAddrV6>>,
-    _sync: Mutex<WatchHandle>,
+    _sync: SendWatchHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,7 +101,7 @@ impl Discovery {
         sock.set_multicast_loop_v6(true)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
         let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
-        let _sync = Mutex::new(
+        let _sync = SendWatchHandle(
             netwatcher::watch_interfaces_with_callback({
                 let sock = sock.clone();
                 let ifaces = ifaces.clone();

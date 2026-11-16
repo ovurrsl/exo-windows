@@ -15,6 +15,7 @@ matches them; its docstring says what to do.
 """
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -64,20 +65,29 @@ def _installed(
     return found if isinstance(found, str) and found else "none"
 
 
+_MLX_DEV_SUFFIX_RE: Final = re.compile(r"\.dev\d+(?:\+[0-9A-Za-z.]+)?$")
+
+
+def _normalize_mlx_version(raw: str) -> str:
+    """Strip git ``.devYYYYMMDD+<sha>`` build suffixes so Darwin and CUDA/PyPI builds match."""
+    return _MLX_DEV_SUFFIX_RE.sub("", raw)
+
+
 def build_id(environ: Mapping[str, str] = os.environ) -> str:
     """Which build of exo this node runs: nodes connect only to the same build.
 
     The macOS app passes its own in ``EXO_BUILD_ID``. A source build is named by exo's package
-    version and the exact MLX and mlx-lm versions it runs (a git build's version names its
-    revision; a frozen build without package metadata reads them from the modules), not by a
-    git commit: developers running one lockfile on several machines connect. That assumes
-    source builds of one package version run the same exo code; two checkouts that change what
-    a model's ranks send each other must not run together.
+    version and the exact MLX and mlx-lm versions it runs (with date-stamped git ``.dev`` suffixes
+    on MLX normalized so macOS source checkouts match Linux/Windows PyPI builds), not by a git
+    commit: developers running one lockfile on several machines connect. That assumes source builds
+    of one package version run the same exo code; two checkouts that change what a model's ranks
+    send each other must not run together.
     """
     given = environ.get(BUILD_ID_ENV, "").strip()
     if given:
         return given
-    return f"exo {__version__}, mlx {_installed('mlx')}, mlx-lm {_installed('mlx-lm')}"
+    mlx_version = _normalize_mlx_version(_installed("mlx"))
+    return f"exo {__version__}, mlx {mlx_version}, mlx-lm {_installed('mlx-lm')}"
 
 
 @final

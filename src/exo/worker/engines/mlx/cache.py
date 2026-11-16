@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 from copy import deepcopy
 from typing import TYPE_CHECKING, cast
 
@@ -30,10 +31,31 @@ if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
+def _is_cuda() -> bool:
+    return sys.platform != "darwin" and hasattr(mx, "cuda") and mx.cuda.is_available()
+
+
+def _cuda_device_memory() -> tuple[int, int] | None:
+    """Return ``(total_vram_bytes, free_vram_bytes)`` on CUDA, or None otherwise."""
+    if not _is_cuda():
+        return None
+    info = mx.device_info()
+    total = info.get("total_memory")
+    if not isinstance(total, int) or total <= 0:
+        return None
+    free = info.get("free_memory")
+    if isinstance(free, int) and free >= 0:
+        return total, free
+    used = mx.get_active_memory() + mx.get_cache_memory()
+    return total, max(total - used, 0)
+
+
 # Fraction of device memory above which LRU eviction kicks in.
 # Smaller machines need more aggressive eviction.
 def _default_memory_threshold() -> float:
-    total_gb = Memory.from_bytes(psutil.virtual_memory().total).in_gb
+    cuda_mem = _cuda_device_memory()
+    total_bytes = cuda_mem[0] if cuda_mem is not None else psutil.virtual_memory().total
+    total_gb = Memory.from_bytes(total_bytes).in_gb
     if total_gb >= 128:
         return 0.85
     if total_gb >= 64:
@@ -52,10 +74,16 @@ _MEMORY_THRESHOLD = float(
 # evicting at 70-85% of RAM: a node that had cached ~300 entries in half an hour generated at
 # a third of its starting speed.
 _MAX_ENTRIES = int(os.environ.get("EXO_PREFIX_CACHE_MAX_ENTRIES", "64"))
+
+
+def _default_max_bytes() -> int:
+    cuda_mem = _cuda_device_memory()
+    total_bytes = cuda_mem[0] if cuda_mem is not None else psutil.virtual_memory().total
+    return total_bytes // 10
+
+
 _MAX_BYTES = int(
-    os.environ.get(
-        "EXO_PREFIX_CACHE_MAX_BYTES", str(psutil.virtual_memory().total // 10)
-    )
+    os.environ.get("EXO_PREFIX_CACHE_MAX_BYTES", str(_default_max_bytes()))
 )
 
 
@@ -547,11 +575,19 @@ def get_prefix_length(prompt: mx.array, cached_prompt: mx.array) -> int:
 
 
 def get_available_memory() -> Memory:
+    cuda_mem = _cuda_device_memory()
+    if cuda_mem is not None:
+        return Memory.from_bytes(cuda_mem[1])
     mem: int = psutil.virtual_memory().available
     return Memory.from_bytes(mem)
 
 
 def get_memory_used_percentage() -> float:
+    cuda_mem = _cuda_device_memory()
+    if cuda_mem is not None:
+        total_vram, free_vram = cuda_mem
+        used_vram = max(total_vram - free_vram, 0)
+        return min(used_vram / total_vram, 1.0)
     mem = psutil.virtual_memory()
     # percent is 0-100
     return float(mem.percent / 100)

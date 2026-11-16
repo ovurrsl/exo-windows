@@ -157,6 +157,44 @@ def map_responses_to_chunks(
             )
 
 
+def _longest_tag_prefix_suffix(text: str, tag: str) -> int:
+    """Return length of the longest non-empty suffix of ``text`` matching a strict prefix of ``tag``."""
+    max_len = min(len(text), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if text.endswith(tag[:length]):
+            return length
+    return 0
+
+
+def _emit_prefix_chunks(
+    pending_buffer: list[GenerationResponse],
+    template_response: GenerationResponse,
+    prefix_len: int,
+    extra_from_template: str,
+    is_thinking: bool,
+) -> Iterator[GenerationResponse]:
+    """Emit ``prefix_len`` chars spanning ``pending_buffer`` + ``extra_from_template``."""
+    remaining = prefix_len
+    for buffered in pending_buffer:
+        if remaining <= 0:
+            break
+        if len(buffered.text) <= remaining:
+            yield buffered.model_copy(update={"is_thinking": is_thinking})
+            remaining -= len(buffered.text)
+        else:
+            yield buffered.model_copy(
+                update={"text": buffered.text[:remaining], "is_thinking": is_thinking}
+            )
+            remaining = 0
+    if remaining > 0:
+        yield template_response.model_copy(
+            update={
+                "text": extra_from_template[:remaining],
+                "is_thinking": is_thinking,
+            }
+        )
+
+
 def parse_thinking_models(
     responses: Generator[GenerationResponse | None],
     think_start: str | None,
@@ -165,14 +203,14 @@ def parse_thinking_models(
 ) -> Generator[GenerationResponse | None]:
     """Route thinking tokens via is_thinking flag.
 
-    Swallows think tag tokens, sets is_thinking on all others.
-    Always yields tokens with finish_reason to avoid hanging the chunk stream.
+    Swallows think tag tokens (including when BPE merges tag boundaries with
+    adjacent punctuation or whitespace), sets is_thinking on all others, and
+    always yields tokens with finish_reason to avoid hanging the chunk stream.
     """
     is_thinking = starts_in_thinking
-    accumulated = ""
     pending_buffer: list[GenerationResponse] = []
 
-    def drain_pending(_is_thinking: bool):
+    def drain_pending(_is_thinking: bool) -> Iterator[GenerationResponse]:
         for buffered in pending_buffer:
             yield buffered.model_copy(update={"is_thinking": _is_thinking})
         pending_buffer.clear()
@@ -182,34 +220,67 @@ def parse_thinking_models(
             yield None
             continue
 
-        accumulated += response.text
-
         if response.finish_reason is not None:
             yield from drain_pending(is_thinking)
             yield response.model_copy(update={"is_thinking": False})
             continue
 
-        if accumulated == think_start and not is_thinking:
-            is_thinking = True
-            accumulated = ""
+        remaining_text = response.text
+        if not remaining_text:
+            if not pending_buffer:
+                yield response.model_copy(update={"is_thinking": is_thinking})
+            continue
+
+        while remaining_text:
+            active_tag = think_end if is_thinking else think_start
+            if not active_tag:
+                yield from drain_pending(is_thinking)
+                yield response.model_copy(
+                    update={"text": remaining_text, "is_thinking": is_thinking}
+                )
+                break
+
+            accumulated = "".join(item.text for item in pending_buffer)
+            combined = accumulated + remaining_text
+            tag_idx = combined.find(active_tag)
+
+            if tag_idx != -1:
+                if tag_idx > 0:
+                    yield from _emit_prefix_chunks(
+                        pending_buffer,
+                        response,
+                        tag_idx,
+                        remaining_text,
+                        is_thinking,
+                    )
+                pending_buffer.clear()
+                is_thinking = not is_thinking
+                remaining_text = combined[tag_idx + len(active_tag) :]
+                continue
+
+            keep = _longest_tag_prefix_suffix(combined, active_tag)
+            if keep == len(combined):
+                pending_buffer.append(
+                    response
+                    if remaining_text == response.text
+                    else response.model_copy(update={"text": remaining_text})
+                )
+                break
+
+            emit_len = len(combined) - keep
+            yield from _emit_prefix_chunks(
+                pending_buffer,
+                response,
+                emit_len,
+                remaining_text,
+                is_thinking,
+            )
             pending_buffer.clear()
-            continue
-        if accumulated == think_end and is_thinking:
-            is_thinking = False
-            accumulated = ""
-            pending_buffer.clear()
-            continue
-
-        if (think_start and accumulated == think_start[: len(accumulated)]) or (
-            think_end and accumulated == think_end[: len(accumulated)]
-        ):
-            pending_buffer.append(response)
-            continue
-
-        accumulated = ""
-
-        yield from drain_pending(is_thinking)
-        yield response.model_copy(update={"is_thinking": is_thinking})
+            if keep > 0:
+                pending_buffer.append(
+                    response.model_copy(update={"text": combined[emit_len:]})
+                )
+            break
 
 
 def parse_tool_calls(

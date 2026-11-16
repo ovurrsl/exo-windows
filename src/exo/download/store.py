@@ -14,6 +14,7 @@ import fnmatch
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -92,16 +93,19 @@ def write_manifest(model_dir: Path, manifest: Manifest) -> None:
     with tempfile.NamedTemporaryFile(
         "w", dir=model_dir, prefix=MANIFEST + ".", delete=False
     ) as temporary:
+        temp_path = Path(temporary.name)
         try:
             temporary.write(manifest.model_dump_json(by_alias=True))
-            os.fchmod(temporary.fileno(), 0o644)
+            if sys.platform != "win32" and hasattr(os, "fchmod"):
+                os.fchmod(temporary.fileno(), 0o644)
         except BaseException:
-            os.unlink(temporary.name)
+            temporary.close()
+            temp_path.unlink(missing_ok=True)
             raise
     try:
-        os.replace(temporary.name, model_dir / MANIFEST)
+        os.replace(temp_path, model_dir / MANIFEST)
     except BaseException:
-        Path(temporary.name).unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
         raise
 
 
