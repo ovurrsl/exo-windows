@@ -672,3 +672,86 @@ class TestThinkingModelsPrefixBuffering:
         assert "<parameter=pattern>" in raw
         assert "</parameter>" in raw
         assert "</function>" in raw
+
+    def test_bpe_merged_think_end_suffix_exits_thinking(self):
+        tokens = [
+            _make_response("work", 0),
+            _make_response(".\n", 1),
+            _make_response("</", 2),
+            _make_response("think", 3),
+            _make_response(">\n\n", 4),
+            _make_response("Merhaba!", 5),
+            _make_response("", 6, finish_reason="stop"),
+        ]
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens),
+                think_start="<think>",
+                think_end="</think>",
+                starts_in_thinking=True,
+            )
+        )
+        gens = [
+            r
+            for r in results
+            if isinstance(r, GenerationResponse) and r.finish_reason is None
+        ]
+        assert [(r.text, r.is_thinking) for r in gens] == [
+            ("work", True),
+            (".\n", True),
+            ("\n\n", False),
+            ("Merhaba!", False),
+        ]
+
+    def test_bpe_merged_think_end_prefix_and_suffix_exits_thinking(self):
+        tokens = [
+            _make_response("work", 0),
+            _make_response(".</", 1),
+            _make_response("think", 2),
+            _make_response(">\n", 3),
+            _make_response("Merhaba!", 4),
+            _make_response("", 5, finish_reason="stop"),
+        ]
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens),
+                think_start="<think>",
+                think_end="</think>",
+                starts_in_thinking=True,
+            )
+        )
+        gens = [
+            r
+            for r in results
+            if isinstance(r, GenerationResponse) and r.finish_reason is None
+        ]
+        assert [(r.text, r.is_thinking) for r in gens] == [
+            ("work", True),
+            (".", True),
+            ("\n", False),
+            ("Merhaba!", False),
+        ]
+
+    def test_single_token_with_inline_think_tags(self):
+        tokens = [
+            _make_response("hi <think>ponder</think>\nanswer", 0),
+            _make_response("", 1, finish_reason="stop"),
+        ]
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens),
+                think_start="<think>",
+                think_end="</think>",
+                starts_in_thinking=False,
+            )
+        )
+        gens = [
+            r
+            for r in results
+            if isinstance(r, GenerationResponse) and r.finish_reason is None
+        ]
+        assert [(r.text, r.is_thinking) for r in gens] == [
+            ("hi ", False),
+            ("ponder", True),
+            ("\nanswer", False),
+        ]
